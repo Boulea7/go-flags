@@ -15,17 +15,35 @@ import (
 )
 
 type alignmentInfo struct {
-	maxLongLen      int
-	hasShort        bool
-	hasValueName    bool
+	maxLongLen   int
+	hasShort     bool
+	hasValueName bool
+
+	// terminalColumns is the width the help message is wrapped at, or 0 when
+	// it should not be wrapped at all.
 	terminalColumns int
-	indent          bool
+
+	indent bool
 }
 
 const (
 	paddingBeforeOption                 = 2
 	distanceBetweenOptionAndDescription = 2
+
+	// minWrapWidth is the narrowest width text is wrapped at, however narrow
+	// the terminal is.
+	minWrapWidth = 10
 )
+
+// wrapWidth returns the width available for text starting at the given column,
+// or 0 when the text should not be wrapped.
+func (a *alignmentInfo) wrapWidth(start int) int {
+	if a.terminalColumns <= 0 {
+		return 0
+	}
+
+	return max(a.terminalColumns-start, minWrapWidth)
+}
 
 func (a *alignmentInfo) descriptionStart() int {
 	ret := a.maxLongLen + distanceBetweenOptionAndDescription
@@ -45,9 +63,7 @@ func (a *alignmentInfo) descriptionStart() int {
 	return ret
 }
 
-func (a *alignmentInfo) updateLen(name string, indent bool) {
-	l := utf8.RuneCountInString(name)
-
+func (a *alignmentInfo) updateLen(l int, indent bool) {
 	if indent {
 		l = l + 4
 	}
@@ -59,26 +75,33 @@ func (a *alignmentInfo) updateLen(name string, indent bool) {
 
 func (p *Parser) getAlignmentInfo() alignmentInfo {
 	ret := alignmentInfo{
-		maxLongLen:      0,
-		hasShort:        false,
-		hasValueName:    false,
-		terminalColumns: getTerminalColumns(),
+		maxLongLen:   0,
+		hasShort:     false,
+		hasValueName: false,
 	}
 
-	if ret.terminalColumns <= 0 {
-		ret.terminalColumns = 80
+	if p.TerminalColumns != 0 {
+		ret.terminalColumns = p.TerminalColumns
+	} else {
+		ret.terminalColumns = getTerminalColumns()
 	}
+
+	// A negative width disables wrapping explicitly, as does the zero width
+	// reported when there is no terminal to wrap the help message for.
+	ret.terminalColumns = max(ret.terminalColumns, 0)
 
 	var prevcmd *Command
+	var minChoicesLen, fullChoicesLen int
 
 	p.eachActiveGroup(func(c *Command, grp *Group) {
 		if c != prevcmd {
 			for _, arg := range c.args {
-				ret.updateLen(arg.Name, c != p.Command)
+				ret.updateLen(utf8.RuneCountInString(arg.Name), c != p.Command)
 			}
 			prevcmd = c
 		}
-		if !grp.showInHelp() {
+		// A hidden command's own options are visible when it is selected.
+		if !grp.showInHelp() && (c == p.Command || grp != c.Group) {
 			return
 		}
 		for _, info := range grp.options {
@@ -94,24 +117,60 @@ func (p *Parser) getAlignmentInfo() alignmentInfo {
 				ret.hasValueName = true
 			}
 
-			l := info.LongNameWithNamespace() + info.ValueName
+			l := utf8.RuneCountInString(info.LongNameWithNamespace() + info.ValueName)
 
-			if len(info.Choices) != 0 {
-				l += "[" + strings.Join(info.Choices, "|") + "]"
+			if len(info.Choices) == 0 {
+				ret.updateLen(l, c != p.Command)
+				continue
 			}
 
-			ret.updateLen(l, c != p.Command)
+			// The full list of choices does not need to fit on a single
+			// line since it is wrapped (see wrapChoices), but the column
+			// must still fit the longest single choice including its
+			// surrounding [ and | or ].
+			longest := 0
+
+			for _, choice := range info.Choices {
+				longest = max(longest, utf8.RuneCountInString(choice))
+			}
+
+			full := l + utf8.RuneCountInString("["+strings.Join(info.Choices, "|")+"]")
+
+			if c != p.Command {
+				l += 4
+				full += 4
+			}
+
+			minChoicesLen = max(minChoicesLen, l+longest+2)
+			fullChoicesLen = max(fullChoicesLen, full)
 		}
 	})
+
+	// Keep choices on a single line as long as descriptions still start
+	// within the first two thirds of the terminal. Otherwise, wrap them so
+	// that descriptions start at the middle of the terminal.
+	overhead := ret.descriptionStart() - ret.maxLongLen + paddingBeforeOption
+	choicesLen := fullChoicesLen
+
+	if ret.terminalColumns > 0 && overhead+choicesLen > ret.terminalColumns*2/3 {
+		choicesLen = ret.terminalColumns/2 - overhead
+	}
+
+	ret.maxLongLen = max(ret.maxLongLen, minChoicesLen, choicesLen)
 
 	return ret
 }
 
+// wrapText wraps s at spaces so that no line exceeds l, indenting every line
+// but the first with prefix. A non-positive l disables wrapping, in which case
+// only the indenting of any lines already in s is applied.
 func wrapText(s string, l int, prefix string) string {
 	var ret string
 
-	if l < 10 {
-		l = 10
+	wrap := l > 0
+
+	if l < minWrapWidth {
+		l = minWrapWidth
 	}
 
 	// Basic text wrapping of s at spaces to fit in l
@@ -122,7 +181,7 @@ func wrapText(s string, l int, prefix string) string {
 
 		line = strings.TrimSpace(line)
 
-		for len(line) > l {
+		for wrap && len(line) > l {
 			// Try to split on space
 			suffix := ""
 
@@ -161,6 +220,40 @@ func wrapText(s string, l int, prefix string) string {
 	}
 
 	return ret
+}
+
+// wrapChoices appends the choices to head as [a|b|c], wrapping them over
+// multiple lines so that no line exceeds width (unless a single choice does).
+// Continuation lines are indented to align with the first choice.
+func wrapChoices(head string, choices []string, width int) []string {
+	single := head + "[" + strings.Join(choices, "|") + "]"
+
+	// Allow a single line to use the full gap before the description
+	if utf8.RuneCountInString(single) < width+distanceBetweenOptionAndDescription {
+		return []string{single}
+	}
+
+	var lines []string
+
+	indent := strings.Repeat(" ", utf8.RuneCountInString(head)+1)
+	cur := head + "["
+
+	for i, choice := range choices {
+		if i == len(choices)-1 {
+			choice += "]"
+		} else {
+			choice += "|"
+		}
+
+		if i > 0 && utf8.RuneCountInString(cur)+utf8.RuneCountInString(choice) > width {
+			lines = append(lines, cur)
+			cur = indent
+		}
+
+		cur += choice
+	}
+
+	return append(lines, cur)
 }
 
 func (p *Parser) writeHelpOption(writer *bufio.Writer, option *Option, info alignmentInfo) {
@@ -204,19 +297,17 @@ func (p *Parser) writeHelpOption(writer *bufio.Writer, option *Option, info alig
 		if len(option.ValueName) > 0 {
 			line.WriteString(option.ValueName)
 		}
-
-		if len(option.Choices) > 0 {
-			line.WriteString("[" + strings.Join(option.Choices, "|") + "]")
-		}
 	}
 
-	written := line.Len()
-	line.WriteTo(writer)
+	optLines := []string{line.String()}
+
+	if option.canArgument() && len(option.Choices) > 0 {
+		optLines = wrapChoices(optLines[0], option.Choices, descstart-distanceBetweenOptionAndDescription)
+	}
+
+	var descLines []string
 
 	if option.Description != "" {
-		dw := descstart - written
-		writer.WriteString(strings.Repeat(" ", dw))
-
 		var def string
 
 		if len(option.DefaultMask) != 0 {
@@ -246,12 +337,25 @@ func (p *Parser) writeHelpOption(writer *bufio.Writer, option *Option, info alig
 			desc = option.Description + envDef
 		}
 
-		writer.WriteString(wrapText(desc,
-			info.terminalColumns-descstart,
-			strings.Repeat(" ", descstart)))
+		descLines = strings.Split(wrapText(desc, info.wrapWidth(descstart), ""), "\n")
 	}
 
-	writer.WriteString("\n")
+	for i := range max(len(optLines), len(descLines)) {
+		var opt string
+
+		if i < len(optLines) {
+			opt = optLines[i]
+		}
+
+		writer.WriteString(opt)
+
+		if i < len(descLines) && descLines[i] != "" {
+			writer.WriteString(strings.Repeat(" ", max(descstart-utf8.RuneCountInString(opt), 1)))
+			writer.WriteString(descLines[i])
+		}
+
+		writer.WriteString("\n")
+	}
 }
 
 func maxCommandLength(s []*Command) int {
@@ -395,7 +499,7 @@ func (p *Parser) WriteHelp(writer io.Writer) {
 
 			// Skip built-in help group for all commands except the top-level
 			// parser
-			if grp.Hidden || (grp.isBuiltinHelp && c != p.Command) {
+			if (grp.Hidden && (c == p.Command || grp != c.Group)) || (grp.isBuiltinHelp && c != p.Command) {
 				return
 			}
 
@@ -452,7 +556,7 @@ func (p *Parser) WriteHelp(writer io.Writer) {
 					// Space between "arg:" and the description start
 					descPadding := strings.Repeat(" ", descStart-len(argPrefix))
 					// How much space the description gets before wrapping
-					descWidth := aligninfo.terminalColumns - 1 - descStart
+					descWidth := aligninfo.wrapWidth(descStart + 1)
 					// Whitespace to which we can indent new description lines
 					descPrefix := strings.Repeat(" ", descStart)
 

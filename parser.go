@@ -27,6 +27,12 @@ type Parser struct {
 	// Option flags changing the behavior of the parser.
 	Options Options
 
+	// TerminalColumns is the width at which the help message is wrapped. When
+	// zero, the width of the terminal attached to stdout is used, and wrapping
+	// is disabled when there is no terminal attached. A negative value
+	// disables wrapping unconditionally.
+	TerminalColumns int
+
 	// NamespaceDelimiter separates group namespaces and option long names
 	NamespaceDelimiter string
 
@@ -373,14 +379,6 @@ func (p *parseState) pop() string {
 	return p.arg
 }
 
-func (p *parseState) peek() string {
-	if p.eof() {
-		return ""
-	}
-
-	return p.args[0]
-}
-
 func (p *parseState) checkRequired(parser *Parser) error {
 	c := parser.Command
 
@@ -497,7 +495,10 @@ func (p *parseState) estimateCommand() error {
 		msg = fmt.Sprintf("Unknown command `%s'", p.retargs[0])
 		errtype = ErrUnknownCommand
 
-		if float32(l)/float32(len(c)) < 0.5 {
+		// l is a distance in runes, so it has to be weighed against the
+		// length of the candidate in runes as well. There is no candidate at
+		// all when every command is hidden.
+		if c != "" && float32(l)/float32(utf8.RuneCountInString(c)) < 0.5 {
 			msg = fmt.Sprintf("%s, did you mean `%s'?", msg, c)
 		} else if len(cmdnames) == 1 {
 			msg = fmt.Sprintf("%s. You should use the %s command",
@@ -539,7 +540,7 @@ func (p *Parser) parseOption(s *parseState, name string, option *Option, canarg 
 			arg = s.pop()
 
 			if validationErr := option.isValidValue(arg); validationErr != nil {
-				return newErrorf(ErrExpectedArgument, validationErr.Error())
+				return newErrorf(ErrExpectedArgument, "%s", validationErr.Error())
 			} else if p.Options&PassDoubleDash != 0 && arg == "--" {
 				return newErrorf(ErrExpectedArgument, "expected argument for flag `%s', but got double dash `--'", option)
 			}

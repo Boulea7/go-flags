@@ -2,6 +2,7 @@ package flags
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,7 +70,7 @@ type lookup struct {
 
 // AddCommand adds a new command to the parser with the given name and data. The
 // data needs to be a pointer to a struct from which the fields indicate which
-// options are in the command. The provided data can implement the Command and
+// options are in the command. The provided data can implement the Commander and
 // Usage interfaces.
 func (c *Command) AddCommand(command string, shortDescription string, longDescription string, data interface{}) (*Command, error) {
 	cmd := newCommand(command, shortDescription, longDescription, data)
@@ -222,10 +223,10 @@ func (c *Command) scanSubcommandHandler(parentg *Group) scanHandler {
 				}
 
 				c.args = append(c.args, arg)
+			}
 
-				if len(mtag.Get("required")) != 0 {
-					c.ArgsRequired = true
-				}
+			if len(mtag.Get("required")) != 0 {
+				c.ArgsRequired = true
 			}
 
 			return true, nil
@@ -236,7 +237,7 @@ func (c *Command) scanSubcommandHandler(parentg *Group) scanHandler {
 		if len(subcommand) != 0 {
 			var ptrval reflect.Value
 
-			if realval.Kind() == reflect.Ptr {
+			if realval.Kind() == reflect.Pointer {
 				ptrval = realval
 
 				if ptrval.IsNil() {
@@ -258,7 +259,7 @@ func (c *Command) scanSubcommandHandler(parentg *Group) scanHandler {
 				return true, err
 			}
 
-			subc.Hidden = mtag.Get("hidden") != ""
+			subc.Hidden = !isStringFalsy(mtag.Get("hidden"))
 
 			if len(subcommandsOptional) > 0 {
 				subc.SubcommandsOptional = true
@@ -348,8 +349,8 @@ func (c *Command) makeLookup() lookup {
 		}
 	}
 
-	for i := len(parents) - 1; i >= 0; i-- {
-		parents[i].fillLookup(&ret, true)
+	for _, cmd := range slices.Backward(parents) {
+		cmd.fillLookup(&ret, true)
 	}
 
 	c.fillLookup(&ret, false)
@@ -402,25 +403,14 @@ func (c *Command) groupByName(name string) *Group {
 	return nil
 }
 
-type commandList []*Command
-
-func (c commandList) Less(i, j int) bool {
-	return c[i].Name < c[j].Name
-}
-
-func (c commandList) Len() int {
-	return len(c)
-}
-
-func (c commandList) Swap(i, j int) {
-	c[i], c[j] = c[j], c[i]
-}
-
 func (c *Command) sortedVisibleCommands() []*Command {
-	ret := commandList(c.visibleCommands())
-	sort.Sort(ret)
+	ret := c.visibleCommands()
 
-	return []*Command(ret)
+	sort.Slice(ret, func(i, j int) bool {
+		return ret[i].Name < ret[j].Name
+	})
+
+	return ret
 }
 
 func (c *Command) visibleCommands() []*Command {
@@ -436,17 +426,7 @@ func (c *Command) visibleCommands() []*Command {
 }
 
 func (c *Command) match(name string) bool {
-	if c.Name == name {
-		return true
-	}
-
-	for _, v := range c.Aliases {
-		if v == name {
-			return true
-		}
-	}
-
-	return false
+	return c.Name == name || slices.Contains(c.Aliases, name)
 }
 
 func (c *Command) hasHelpOptions() bool {

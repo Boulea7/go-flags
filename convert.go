@@ -5,8 +5,10 @@
 package flags
 
 import (
+	"encoding"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +53,16 @@ func getBase(options multiTag, base int) (int, error) {
 	return base, err
 }
 
+// keyValueDelimiter returns the delimiter separating the key from the value
+// for map typed options, as configured by the key-value-delimiter tag.
+func keyValueDelimiter(options multiTag) string {
+	if delim := options.Get("key-value-delimiter"); delim != "" {
+		return delim
+	}
+
+	return ":"
+}
+
 func convertMarshal(val reflect.Value) (bool, string, error) {
 	// Check first for the Marshaler interface
 	if val.IsValid() && val.Type().NumMethod() > 0 && val.CanInterface() {
@@ -58,6 +70,15 @@ func convertMarshal(val reflect.Value) (bool, string, error) {
 			ret, err := marshaler.MarshalFlag()
 			return true, ret, err
 		}
+
+		if marshaler, ok := val.Interface().(encoding.TextMarshaler); ok {
+			ret, err := marshaler.MarshalText()
+			return true, string(ret), err
+		}
+	}
+
+	if val.IsValid() && val.Type().Kind() != reflect.Pointer && val.CanAddr() {
+		return convertMarshal(val.Addr())
 	}
 
 	return false, "", nil
@@ -75,7 +96,7 @@ func convertToString(val reflect.Value, options multiTag) (string, error) {
 	tp := val.Type()
 
 	// Support for time.Duration
-	if tp == reflect.TypeOf((*time.Duration)(nil)).Elem() {
+	if tp == reflect.TypeFor[time.Duration]() {
 		stringer := val.Interface().(fmt.Stringer)
 		return stringer.String(), nil
 	}
@@ -112,11 +133,13 @@ func convertToString(val reflect.Value, options multiTag) (string, error) {
 			return "", nil
 		}
 
-		ret := "["
+		var ret strings.Builder
+
+		ret.WriteString("[")
 
 		for i := 0; i < val.Len(); i++ {
 			if i != 0 {
-				ret += ", "
+				ret.WriteString(", ")
 			}
 
 			item, err := convertToString(val.Index(i), options)
@@ -125,18 +148,25 @@ func convertToString(val reflect.Value, options multiTag) (string, error) {
 				return "", err
 			}
 
-			ret += item
+			ret.WriteString(item)
 		}
 
-		return ret + "]", nil
+		ret.WriteString("]")
+
+		return ret.String(), nil
 	case reflect.Map:
-		ret := "{"
+		delim := keyValueDelimiter(options)
 
-		for i, key := range val.MapKeys() {
-			if i != 0 {
-				ret += ", "
-			}
+		// Map iteration order is not stable, so the entries are sorted by
+		// their stringified key to keep the result reproducible.
+		type entry struct {
+			key string
+			str string
+		}
 
+		entries := make([]entry, 0, val.Len())
+
+		for _, key := range val.MapKeys() {
 			keyitem, err := convertToString(key, options)
 
 			if err != nil {
@@ -149,11 +179,21 @@ func convertToString(val reflect.Value, options multiTag) (string, error) {
 				return "", err
 			}
 
-			ret += keyitem + ":" + item
+			entries = append(entries, entry{key: keyitem, str: keyitem + delim + item})
 		}
 
-		return ret + "}", nil
-	case reflect.Ptr:
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].key < entries[j].key
+		})
+
+		strs := make([]string, len(entries))
+
+		for i, e := range entries {
+			strs[i] = e.str
+		}
+
+		return "{" + strings.Join(strs, ", ") + "}", nil
+	case reflect.Pointer:
 		return convertToString(reflect.Indirect(val), options)
 	case reflect.Interface:
 		if !val.IsNil() {
@@ -167,7 +207,7 @@ func convertToString(val reflect.Value, options multiTag) (string, error) {
 func convertUnmarshal(val string, retval reflect.Value) (bool, error) {
 	if retval.Type().NumMethod() > 0 && retval.CanInterface() {
 		if unmarshaler, ok := retval.Interface().(Unmarshaler); ok {
-			if retval.IsNil() {
+			if retval.Kind() == reflect.Pointer && retval.IsNil() {
 				retval.Set(reflect.New(retval.Type().Elem()))
 
 				// Re-assign from the new value
@@ -176,9 +216,20 @@ func convertUnmarshal(val string, retval reflect.Value) (bool, error) {
 
 			return true, unmarshaler.UnmarshalFlag(val)
 		}
+
+		if unmarshaler, ok := retval.Interface().(encoding.TextUnmarshaler); ok {
+			if retval.Kind() == reflect.Pointer && retval.IsNil() {
+				retval.Set(reflect.New(retval.Type().Elem()))
+
+				// Re-assign from the new value
+				unmarshaler = retval.Interface().(encoding.TextUnmarshaler)
+			}
+
+			return true, unmarshaler.UnmarshalText([]byte(val))
+		}
 	}
 
-	if retval.Type().Kind() != reflect.Ptr && retval.CanAddr() {
+	if retval.Type().Kind() != reflect.Pointer && retval.CanAddr() {
 		return convertUnmarshal(val, retval.Addr())
 	}
 
@@ -197,7 +248,7 @@ func convert(val string, retval reflect.Value, options multiTag) error {
 	tp := retval.Type()
 
 	// Support for time.Duration
-	if tp == reflect.TypeOf((*time.Duration)(nil)).Elem() {
+	if tp == reflect.TypeFor[time.Duration]() {
 		parsed, err := time.ParseDuration(val)
 
 		if err != nil {
@@ -271,12 +322,7 @@ func convert(val string, retval reflect.Value, options multiTag) error {
 
 		retval.Set(reflect.Append(retval, elemval))
 	case reflect.Map:
-		keyValueDelimiter := options.Get("key-value-delimiter")
-		if keyValueDelimiter == "" {
-			keyValueDelimiter = ":"
-		}
-
-		parts := strings.SplitN(val, keyValueDelimiter, 2)
+		parts := strings.SplitN(val, keyValueDelimiter(options), 2)
 
 		key := parts[0]
 		var value string
@@ -304,7 +350,7 @@ func convert(val string, retval reflect.Value, options multiTag) error {
 		}
 
 		retval.SetMapIndex(reflect.Indirect(keyval), reflect.Indirect(valueval))
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if retval.IsNil() {
 			retval.Set(reflect.New(retval.Type().Elem()))
 		}
@@ -335,16 +381,6 @@ func quoteIfNeeded(s string) string {
 	}
 
 	return s
-}
-
-func quoteIfNeededV(s []string) []string {
-	ret := make([]string, len(s))
-
-	for i, v := range s {
-		ret[i] = quoteIfNeeded(v)
-	}
-
-	return ret
 }
 
 func quoteV(s []string) []string {

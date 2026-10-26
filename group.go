@@ -90,16 +90,19 @@ func (g *Group) Options() []*Option {
 	return g.options
 }
 
+// Data returns the underlying data value associated with this instance.
+func (g *Group) Data() interface{} {
+	return g.data
+}
+
 // Find locates the subgroup with the given short description and returns it.
 // If no such group can be found Find will return nil. Note that the description
 // is matched case insensitively.
 func (g *Group) Find(shortDescription string) *Group {
-	lshortDescription := strings.ToLower(shortDescription)
-
 	var ret *Group
 
 	g.eachGroup(func(gg *Group) {
-		if gg != g && strings.ToLower(gg.ShortDescription) == lshortDescription {
+		if gg != g && strings.EqualFold(gg.ShortDescription, shortDescription) {
 			ret = gg
 		}
 	})
@@ -237,7 +240,7 @@ func (g *Group) scanStruct(realval reflect.Value, sfield *reflect.StructField, h
 			if err := g.scanStruct(fld, &field, handler); err != nil {
 				return err
 			}
-		} else if kind == reflect.Ptr && field.Type.Elem().Kind() == reflect.Struct {
+		} else if kind == reflect.Pointer && field.Type.Elem().Kind() == reflect.Struct {
 			flagCountBefore := len(g.options) + len(g.groups)
 
 			if fld.IsNil() {
@@ -313,6 +316,12 @@ func (g *Group) scanStruct(realval reflect.Value, sfield *reflect.StructField, h
 				option.shortAndLongName())
 		}
 
+		if option.isBool() && len(option.Choices) != 0 {
+			return newErrorf(ErrInvalidTag,
+				"boolean flag `%s' may not have choices, they are restricted to `false' and `true'",
+				option.shortAndLongName())
+		}
+
 		g.options = append(g.options, option)
 	}
 
@@ -361,11 +370,11 @@ func (g *Group) scanSubGroupHandler(realval reflect.Value, sfield *reflect.Struc
 	if len(subgroup) != 0 {
 		var ptrval reflect.Value
 
-		if realval.Kind() == reflect.Ptr {
+		if realval.Kind() == reflect.Pointer {
 			ptrval = realval
 
 			if ptrval.IsNil() {
-				ptrval.Set(reflect.New(ptrval.Type()))
+				ptrval.Set(reflect.New(ptrval.Type().Elem()))
 			}
 		} else {
 			ptrval = realval.Addr()
@@ -381,7 +390,7 @@ func (g *Group) scanSubGroupHandler(realval reflect.Value, sfield *reflect.Struc
 
 		group.Namespace = mtag.Get("namespace")
 		group.EnvNamespace = mtag.Get("env-namespace")
-		group.Hidden = mtag.Get("hidden") != ""
+		group.Hidden = !isStringFalsy(mtag.Get("hidden"))
 
 		return true, nil
 	}
@@ -393,7 +402,7 @@ func (g *Group) scanType(handler scanHandler) error {
 	// Get all the public fields in the data struct
 	ptrval := reflect.ValueOf(g.data)
 
-	if ptrval.Type().Kind() != reflect.Ptr {
+	if ptrval.Type().Kind() != reflect.Pointer {
 		panic(ErrNotPointerToStruct)
 	}
 

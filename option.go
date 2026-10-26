@@ -2,9 +2,11 @@ package flags
 
 import (
 	"bytes"
+	"encoding"
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -250,17 +252,8 @@ func (option *Option) Set(value *string) error {
 	option.preventDefault = true
 	option.clearReferenceBeforeSet = false
 
-	if len(option.Choices) != 0 {
-		found := false
-
-		for _, choice := range option.Choices {
-			if choice == *value {
-				found = true
-				break
-			}
-		}
-
-		if !found {
+	if len(option.Choices) != 0 && value != nil {
+		if !slices.Contains(option.Choices, *value) {
 			allowed := strings.Join(option.Choices[0:len(option.Choices)-1], ", ")
 
 			if len(option.Choices) > 1 {
@@ -303,6 +296,10 @@ func (option *Option) showInHelp() bool {
 
 func (option *Option) canArgument() bool {
 	if u := option.isUnmarshaler(); u != nil {
+		return true
+	}
+
+	if u := option.isTextUnmarshaler(); u != nil {
 		return true
 	}
 
@@ -415,6 +412,30 @@ func (option *Option) isUnmarshaler() Unmarshaler {
 	return nil
 }
 
+func (option *Option) isTextUnmarshaler() encoding.TextUnmarshaler {
+	v := option.value
+
+	for {
+		if !v.CanInterface() {
+			break
+		}
+
+		i := v.Interface()
+
+		if u, ok := i.(encoding.TextUnmarshaler); ok {
+			return u
+		}
+
+		if !v.CanAddr() {
+			break
+		}
+
+		v = v.Addr()
+	}
+
+	return nil
+}
+
 func (option *Option) isValueValidator() ValueValidator {
 	v := option.value
 
@@ -444,7 +465,7 @@ func (option *Option) isBool() bool {
 
 	for {
 		switch tp.Kind() {
-		case reflect.Slice, reflect.Ptr:
+		case reflect.Slice, reflect.Pointer:
 			tp = tp.Elem()
 		case reflect.Bool:
 			return true
@@ -461,7 +482,7 @@ func (option *Option) isSignedNumber() bool {
 
 	for {
 		switch tp.Kind() {
-		case reflect.Slice, reflect.Ptr:
+		case reflect.Slice, reflect.Pointer:
 			tp = tp.Elem()
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Float32, reflect.Float64:
 			return true
@@ -493,7 +514,7 @@ func (option *Option) call(value *string) error {
 		retval = option.value.Call([]reflect.Value{val})
 	}
 
-	if len(retval) == 1 && retval[0].Type() == reflect.TypeOf((*error)(nil)).Elem() {
+	if len(retval) == 1 && retval[0].Type() == reflect.TypeFor[error]() {
 		if retval[0].Interface() == nil {
 			return nil
 		}
@@ -512,7 +533,7 @@ func (option *Option) updateDefaultLiteral() {
 		var showdef bool
 
 		switch option.field.Type.Kind() {
-		case reflect.Func, reflect.Ptr:
+		case reflect.Func, reflect.Pointer:
 			showdef = !option.value.IsNil()
 		case reflect.Slice, reflect.String, reflect.Array:
 			showdef = option.value.Len() > 0
@@ -529,7 +550,7 @@ func (option *Option) updateDefaultLiteral() {
 	} else if len(defs) != 0 {
 		l := len(defs) - 1
 
-		for i := 0; i < l; i++ {
+		for i := range l {
 			def += quoteIfNeeded(defs[i]) + ", "
 		}
 

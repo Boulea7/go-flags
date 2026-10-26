@@ -3,7 +3,6 @@ package flags
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
@@ -766,7 +765,7 @@ value = some other value
 	opts.NoValue = "some value"
 	opts.Value = "some other value"
 
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
 	}
@@ -777,7 +776,7 @@ value = some other value
 		t.Fatalf("Could not write ini file: %s", err)
 	}
 
-	found, err := ioutil.ReadFile(file.Name())
+	found, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Could not read written ini file: %s", err)
 	}
@@ -788,7 +787,7 @@ value = some other value
 }
 
 func TestIniParse(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
 	}
@@ -816,7 +815,7 @@ func TestIniParse(t *testing.T) {
 }
 
 func TestIniCliOverrides(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
@@ -864,7 +863,7 @@ func TestIniCliOverrides(t *testing.T) {
 }
 
 func TestIniOverrides(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
@@ -904,7 +903,7 @@ func TestIniOverrides(t *testing.T) {
 }
 
 func TestIniOverridesFromConfigFlag(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
@@ -996,7 +995,7 @@ item=abc`
 }
 
 func TestWriteFile(t *testing.T) {
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Cannot create temporary file: %s", err)
 	}
@@ -1016,7 +1015,7 @@ func TestWriteFile(t *testing.T) {
 		t.Fatalf("Could not write ini file: %s", err)
 	}
 
-	found, err := ioutil.ReadFile(file.Name())
+	found, err := os.ReadFile(file.Name())
 	if err != nil {
 		t.Fatalf("Could not read written ini file: %s", err)
 	}
@@ -1166,5 +1165,83 @@ func TestIniOverwriteOptions(t *testing.T) {
 			t.Fatalf("Expected Toggle to be \"%v\" but was \"%v\" with args %+v", test.toggled, opts.Toggle, test.args)
 		}
 
+	}
+}
+
+func TestIniParseMapEmptyValue(t *testing.T) {
+	var opts struct {
+		M map[string]string `long:"m"`
+	}
+
+	p := NewNamedParser("test", Default)
+	p.AddGroup("Application Options", "", &opts)
+
+	inip := NewIniParser(p)
+	err := inip.Parse(strings.NewReader("[Application Options]\nM = foo:\n"))
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if v, ok := opts.M["foo"]; !ok || v != "" {
+		t.Errorf("Expected map[foo:], but got %v", opts.M)
+	}
+}
+
+func TestIniMapWithDelimiterRoundTrip(t *testing.T) {
+	type options struct {
+		M map[string]string `long:"m" key-value-delimiter:"="`
+	}
+
+	var written options
+
+	p := NewNamedParser("test", None)
+	p.AddGroup("Application Options", "", &written)
+
+	if _, err := p.ParseArgs([]string{"--m", "key=value"}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var b bytes.Buffer
+	NewIniParser(p).Write(&b, IniIncludeDefaults)
+
+	if !strings.Contains(b.String(), "M = key=value") {
+		t.Errorf("Expected the configured delimiter to be used, but got:\n%s", b.String())
+	}
+
+	var read options
+
+	p2 := NewNamedParser("test", None)
+	p2.AddGroup("Application Options", "", &read)
+
+	if err := NewIniParser(p2).Parse(&b); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if v, ok := read.M["key"]; !ok || v != "value" {
+		t.Errorf("Expected map[key:value] to round trip, but got %v", read.M)
+	}
+}
+
+func TestIniParseSectionOrderIsStable(t *testing.T) {
+	type options struct {
+		Value string `long:"value"`
+	}
+
+	// The same option is set in the global section and in a named one. The
+	// last section in the file has to win, consistently.
+	const contents = "value = global\n[Application Options]\nvalue = named\n"
+
+	for range 100 {
+		var opts options
+
+		p := NewNamedParser("test", None)
+		p.AddGroup("Application Options", "", &opts)
+
+		if err := NewIniParser(p).Parse(strings.NewReader(contents)); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		assertString(t, opts.Value, "named")
 	}
 }

@@ -399,6 +399,55 @@ Help Options:
 	}
 }
 
+func TestHiddenCommandHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"secretcmd", "--help"},
+		{"secretcmd", "child", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var expected string
+			for _, hidden := range []bool{false, true} {
+				var opts struct {
+					Output      string `short:"o" long:"long-output-filename" value-name:"FILE" description:"Output file"`
+					Secret      bool   `long:"secret-option" hidden:"yes"`
+					HiddenGroup struct {
+						Value bool `long:"hidden-group-option"`
+					} `group:"Hidden options" hidden:"yes"`
+					Child struct {
+						Verbose bool `long:"verbose" description:"Verbose output"`
+					} `command:"child" description:"Child command"`
+				}
+				p := NewNamedParser("app", HelpFlag)
+				cmd, err := p.AddCommand("secretcmd", "Secret command", "", &opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd.Hidden = hidden
+				if hidden {
+					var top bytes.Buffer
+					p.WriteHelp(&top)
+					if strings.Contains(top.String(), "secretcmd") {
+						t.Fatalf("hidden command appears in top-level help: %s", top.String())
+					}
+				}
+				_, err = p.ParseArgs(args)
+				if !WroteHelp(err) {
+					t.Fatalf("expected help, got %v", err)
+				}
+				got := err.(*Error).Message
+				if strings.Contains(got, "secret-option") || strings.Contains(got, "hidden-group-option") {
+					t.Fatalf("hidden options appear in help: %s", got)
+				}
+				if !hidden {
+					expected = got
+				} else {
+					assertDiff(t, got, expected, "explicit hidden command help")
+				}
+			}
+		})
+	}
+}
+
 func TestHiddenCommandNoBuiltinHelp(t *testing.T) {
 	oldEnv := EnvSnapshot()
 	defer oldEnv.Restore()
@@ -464,8 +513,12 @@ func TestHiddenCommandNoBuiltinHelp(t *testing.T) {
 
 Long hidden command description
 
+[hidden command options]
+      /f, /very-long-foo-option   Very long foo description
+      /b                          Option bar
+
 [hidden command arguments]
-  <positional-foo>:         positional foo
+  <positional-foo>:               positional foo
 `
 		} else {
 			expected = `Usage:
@@ -473,8 +526,12 @@ Long hidden command description
 
 Long hidden command description
 
+[hidden command options]
+      -f, --very-long-foo-option  Very long foo description
+      -b                          Option bar
+
 [hidden command arguments]
-  <positional-foo>:         positional foo
+  <positional-foo>:               positional foo
 `
 		}
 		h := &bytes.Buffer{}
@@ -673,7 +730,7 @@ func TestHelpDefaultMask(t *testing.T) {
 		w := bufio.NewWriter(h)
 		p.writeHelpOption(w, p.FindOptionByShortName('v'), p.getAlignmentInfo())
 		w.Flush()
-		if strings.Index(h.String(), test.present) < 0 {
+		if !strings.Contains(h.String(), test.present) {
 			t.Errorf("Not present %q\n%s", test.present, h.String())
 		}
 	}
@@ -699,4 +756,125 @@ func TestWroteHelp(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHelpWrapChoices(t *testing.T) {
+	var opts struct {
+		Verbose bool   `short:"v" long:"verbose" description:"Show verbose debug information"`
+		Level   string `short:"l" long:"level" choice:"trace" choice:"debug" choice:"info" choice:"notice" choice:"warning" choice:"error" choice:"critical" choice:"alert" choice:"emergency" description:"The log level used to filter which messages are written to the output, defaults to info"`
+		Format  string `long:"format" value-name:"FMT" choice:"text" choice:"json" description:"Output format"`
+	}
+
+	p := NewNamedParser("TestHelpWrapChoices", HelpFlag)
+	p.AddGroup("Application Options", "The application options", &opts)
+
+	_, err := p.ParseArgs([]string{"--help"})
+
+	if err == nil {
+		t.Fatalf("Expected help error")
+	}
+
+	e, ok := err.(*Error)
+
+	if !ok || e.Type != ErrHelp {
+		t.Fatalf("Expected ErrHelp, got %v", err)
+	}
+
+	var expected string
+
+	if runtime.GOOS == "windows" {
+		expected = `Usage:
+  TestHelpWrapChoices [OPTIONS]
+
+Application Options:
+  /v, /verbose                          Show verbose debug information
+  /l, /level:[trace|debug|info|notice|  The log level used to filter which
+              warning|error|critical|   messages are written to the output,
+              alert|emergency]          defaults to info
+      /format:FMT[text|json]            Output format
+
+Help Options:
+  /?                                    Show this help message
+  /h, /help                             Show this help message
+`
+	} else {
+		expected = `Usage:
+  TestHelpWrapChoices [OPTIONS]
+
+Application Options:
+  -v, --verbose                         Show verbose debug information
+  -l, --level=[trace|debug|info|        The log level used to filter which
+               notice|warning|error|    messages are written to the output,
+               critical|alert|          defaults to info
+               emergency]
+      --format=FMT[text|json]           Output format
+
+Help Options:
+  -h, --help                            Show this help message
+`
+	}
+
+	assertDiff(t, e.Message, expected, "help message")
+}
+
+type helpWrappingOptions struct {
+	Long string `long:"long" description:"Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua"`
+}
+
+func helpWrappingMessage(t *testing.T, columns int) string {
+	t.Helper()
+
+	var opts helpWrappingOptions
+
+	p := NewNamedParser("TestHelpWrapping", 0)
+	p.AddGroup("Application Options", "The application options", &opts)
+	p.TerminalColumns = columns
+
+	var buf bytes.Buffer
+	p.WriteHelp(&buf)
+
+	return buf.String()
+}
+
+// helpWrappingOption is how the option of helpWrappingOptions is rendered,
+// padded so that the description starts at the same column on all platforms.
+func helpWrappingOption() string {
+	if runtime.GOOS == "windows" {
+		return "  /long: "
+	}
+
+	return "  --long="
+}
+
+func TestHelpWrappingTerminalColumns(t *testing.T) {
+	expected := `Usage:
+  TestHelpWrapping
+
+Application Options:
+` + helpWrappingOption() + `   Lorem ipsum dolor sit amet, consectetur
+            adipisicing elit, sed do eiusmod tempor
+            incididunt ut labore et dolore magna aliqua
+`
+
+	assertDiff(t, helpWrappingMessage(t, 60), expected, "help message")
+}
+
+func TestHelpWrappingDisabled(t *testing.T) {
+	expected := `Usage:
+  TestHelpWrapping
+
+Application Options:
+` + helpWrappingOption() + `   Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua
+`
+
+	// A negative width disables wrapping explicitly.
+	assertDiff(t, helpWrappingMessage(t, -1), expected, "help message")
+
+	// So does the absence of a terminal to wrap for.
+	saved := terminalColumnsOverride
+	defer func() { terminalColumnsOverride = saved }()
+
+	terminalColumnsOverride = 0
+
+	assertDiff(t, helpWrappingMessage(t, 0), expected, "help message")
 }
